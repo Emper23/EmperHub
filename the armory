@@ -1,0 +1,736 @@
+-- =====================================================================
+-- 💎 Emper Hub - The Armory (Auto Farm Ground & Crates & Auto Deposit)
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+-- [ 0. ระบบป้องกันการรันซ้ำเพื่อกันค้าง (Re-run Guard) ]
+local scriptId = game:GetService("HttpService"):GenerateGUID(false)
+getgenv().TheArmory_ScriptId = scriptId
+
+if getgenv().TheArmory_Cleanup then
+    pcall(getgenv().TheArmory_Cleanup)
+end
+
+local connections = {}
+getgenv().TheArmory_Cleanup = function()
+    if getgenv().TheArmory_ScriptId == scriptId then
+        getgenv().TheArmory_ScriptId = nil
+    end
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+end
+
+-- [ 0.5. ปรับแต่ง ProximityPrompt ทั้งหมดเพื่อกันกล้อง/โมเดลบัง ]
+local function setupPrompt(prompt)
+    if prompt:IsA("ProximityPrompt") then
+        pcall(function()
+            prompt.RequiresLineOfSight = false
+        end)
+    end
+end
+
+for _, desc in ipairs(workspace:GetDescendants()) do
+    setupPrompt(desc)
+end
+
+table.insert(connections, workspace.DescendantAdded:Connect(setupPrompt))
+
+-- โหลด EmperUI Library
+local EmperUI
+local successUI, errUI = pcall(function()
+    return loadstring(game:HttpGet("http://localhost:8000/EmperUI.lua?t=" .. tostring(tick())))()
+end)
+if successUI and errUI then
+    EmperUI = errUI
+else
+    EmperUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Emper23/EmperUI.lua/refs/heads/main/EmperUI.lua"))()
+end
+
+-- [ 1. สร้างหน้าต่างหลัก ]
+local Window = EmperUI:CreateWindow({
+    Title = "The Armory Hub",
+    Icon = "rbxassetid://11681541018",
+    Size = UDim2.new(0, 680, 0, 450),
+    ToggleKey = Enum.KeyCode.RightControl,
+    UIStyle = "EmperUI"
+})
+
+Window:EnableAuroraBackground()
+Window:SetWatermark("✨ The Armory Hub | FPS: {fps} | Ping: {ping}")
+
+-- เปิดใช้งาน RichText ให้กับตัวหนังสือใน UI ทั้งหมด
+local function enableRichText(gui)
+    local function apply(desc)
+        if desc:IsA("TextLabel") then
+            desc.RichText = true
+        end
+    end
+    for _, desc in ipairs(gui:GetDescendants()) do
+        apply(desc)
+    end
+    table.insert(connections, gui.DescendantAdded:Connect(apply))
+end
+
+if getgenv().EmperUI_Instance then
+    enableRichText(getgenv().EmperUI_Instance)
+end
+
+-- [ 2. สร้างแท็บใช้งาน ]
+local MainTab = Window:CreateTab("Main", "house")
+local SettingsTab = Window:CreateTab("Settings", "settings")
+
+local MainLeft = MainTab:CreateSection("Auto Farm")
+local MainRight = MainTab:CreateSection("Status")
+
+local SetLeft = SettingsTab:CreateSection("Configs")
+Window:BuildSettingsSystem(SetLeft, "TheArmoryConfigs")
+
+-- [ 3. ประกาศตัวแปรควบคุม ]
+local AutoFarmEnabled = false
+local MIN_DEPOSIT_RARITY = 6
+local AutoSellEnabled = false
+local SelectedSellRarities = { [1] = true, [2] = true, [3] = true, [4] = true, [5] = true }
+local isDepositing = false
+
+local RarityNameToValue = {
+    ["Common"] = 1,
+    ["Uncommon"] = 2,
+    ["Rare"] = 3,
+    ["Epic"] = 4,
+    ["Legendary"] = 5,
+    ["Mythic"] = 6,
+    ["Divine"] = 7,
+    ["Trancendent"] = 8,
+    ["Transcendent"] = 8,
+    ["Emerald"] = 9,
+    ["Voltaic"] = 10
+}
+
+-- 📍 พิกัดตู้ล็อกเกอร์จากโมเดลในแมพ (Interactible ช่องที่ 6)
+local function getLockerCFrame()
+    local target = workspace:FindFirstChild("Interactible") and workspace.Interactible:GetChildren()[6]
+    if target then
+        if target:IsA("BasePart") then
+            return target.CFrame
+        elseif target:IsA("Model") then
+            return target:GetPivot()
+        end
+    end
+    return CFrame.new(
+        -56.1436501, 5.868999, 109.762741, 
+        0.970621407, -1.13886649e-07, -0.240611941, 
+        1.20918884e-07, 1, 1.44622936e-08, 
+        0.240611941, -4.31319371e-08, 0.970621407
+    )
+end
+
+-- ระบบวาร์ปของแมพ
+if not TeleportToZone then
+    _G.TeleportToZone = function()
+        pcall(function()
+            local args = {
+                workspace:WaitForChild("Interactible"):WaitForChild("Insertion Point SZ"),
+                workspace:WaitForChild("Hatches"):WaitForChild("Zone1"):WaitForChild("Hatch"):WaitForChild("PlayerNode")
+            }
+            game:GetService("ReplicatedStorage"):WaitForChild("Remotes"):WaitForChild("TeleporterRequest"):InvokeServer(unpack(args))
+        end)
+    end
+else
+    _G.TeleportToZone = TeleportToZone
+end
+
+-- ฟังก์ชันดึงระดับความหายากของไอเทม
+local GetRarity = GetRarityFromItem or function(item) 
+    if not item then return 0 end
+    return item:GetAttribute("Rarity") or 5 
+end
+
+-- ฟังก์ชันจำลองการคลิก GUI
+local function virtualClick(guiObject)
+    if not guiObject then return end
+    
+    local absolutePosition = guiObject.AbsolutePosition
+    local absoluteSize = guiObject.AbsoluteSize
+    local centerPosition = absolutePosition + (absoluteSize / 2)
+    
+    VirtualInputManager:SendMouseMoveEvent(centerPosition.X, centerPosition.Y, game)
+    task.wait(0.1)
+    
+    VirtualInputManager:SendMouseButtonEvent(centerPosition.X, centerPosition.Y, 0, true, game, 1)
+    task.wait(0.05)
+    VirtualInputManager:SendMouseButtonEvent(centerPosition.X, centerPosition.Y, 0, false, game, 1)
+    task.wait(0.2)
+end
+
+-- ฟังก์ชันคลิกปุ่ม GUI แบบปลอดภัย (ใช้ firesignal ถ้ามี หากไม่มีจะใช้การจำลองการคลิก)
+local function safeClick(guiObject)
+    if not guiObject then return end
+    local clicked = false
+    pcall(function()
+        if firesignal then
+            firesignal(guiObject.MouseButton1Click)
+            firesignal(guiObject.Activated)
+            clicked = true
+        end
+    end)
+    if not clicked then
+        virtualClick(guiObject)
+    end
+end
+
+-- ฟังก์ชันค้นหาปุ่มเปิด Locker (จากวัตถุช่องที่ 6 ของ workspace.Interactible)
+local function findLockerPrompt()
+    local target = workspace:FindFirstChild("Interactible") and workspace.Interactible:GetChildren()[6]
+    if target then
+        if target:IsA("ProximityPrompt") then
+            return target
+        end
+        local prompt = target:FindFirstChildWhichIsA("ProximityPrompt") or target:FindFirstChildOfClass("ProximityPrompt")
+        if prompt then
+            return prompt
+        end
+        for _, desc in ipairs(target:GetDescendants()) do
+            if desc:IsA("ProximityPrompt") then
+                return desc
+            end
+        end
+    end
+    return nil
+end
+
+-- ฟังก์ชันส่งการกด Prompt
+local function FireLootPrompt(prompt)
+    if not prompt then return end
+    pcall(function()
+        prompt.RequiresLineOfSight = false
+    end)
+    if fireproximityprompt then
+        fireproximityprompt(prompt)
+    else
+        pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(prompt.HoldDuration or 0.1)
+            prompt:InputHoldEnd()
+        end)
+    end
+end
+
+-- ฟังก์ชันฝากของเข้าล็อกเกอร์
+local function DepositLocker()
+    if isDepositing then return end
+    isDepositing = true
+    
+    local success, err = pcall(function()
+        local char = LocalPlayer.Character
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not backpack or not humanoid or not hrp then return end
+        
+        -- ปลดอาวุธทั้งหมดกลับเข้า Backpack ก่อน
+        humanoid:UnequipTools()
+        task.wait(0.2)
+        
+        -- ค้นหาไอเทมตามเกณฑ์ความหายาก
+        local itemsToDeposit = {}
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                local rarity = GetRarity(item)
+                if rarity >= MIN_DEPOSIT_RARITY then
+                    table.insert(itemsToDeposit, item)
+                end
+            end
+        end
+        
+        if #itemsToDeposit == 0 then
+            print("ไม่มีไอเทมตรงเกณฑ์ที่ต้องฝาก")
+            return
+        end
+        
+        -- วาร์ปกลับมาหน้าล็อกเกอร์ก่อนเริ่มฝากของ
+        hrp.CFrame = getLockerCFrame()
+        task.wait(0.5)
+        
+        local lockerPrompt = findLockerPrompt()
+        if not lockerPrompt then
+            warn("ไม่พบปุ่มตู้ Locker ใกล้ตัว")
+            return
+        end
+        
+        FireLootPrompt(lockerPrompt)
+        task.wait(1.5)
+        
+        local lockerGui = PlayerGui:FindFirstChild("LockerGui")
+        if not lockerGui then
+            warn("ไม่พบ LockerGui")
+            return
+        end
+        
+        local scrollingFrame = lockerGui:FindFirstChild("Frame", true) 
+            and lockerGui.Frame:FindFirstChild("Frame", true) 
+            and lockerGui.Frame.Frame:FindFirstChild("Inset", true) 
+            and lockerGui.Frame.Frame.Inset:FindFirstChild("ScrollingFrame", true)
+            
+        if not scrollingFrame then
+            warn("ไม่พบ ScrollingFrame")
+            return
+        end
+        
+        print("กำลังเริ่มฝากของ " .. tostring(#itemsToDeposit) .. " ชิ้น เข้าล็อกเกอร์...")
+        
+        for _, item in ipairs(itemsToDeposit) do
+            if not item or not item.Parent then continue end
+            
+            local targetSlot = nil
+            for _, child in ipairs(scrollingFrame:GetChildren()) do
+                if child:IsA("GuiObject") and child.Name:find("Card") then
+                    local viewport = child:FindFirstChild("Frame") and child.Frame:FindFirstChild("ViewportFrame")
+                    if viewport then
+                        local isEmpty = true
+                        for _, vChild in ipairs(viewport:GetChildren()) do
+                            if vChild:IsA("Model") or vChild:IsA("BasePart") or vChild:IsA("MeshPart") or vChild:IsA("Folder") then
+                                isEmpty = false
+                                break
+                            end
+                        end
+                        if isEmpty then
+                            targetSlot = child
+                            break
+                        end
+                    end
+                end
+            end
+            
+            if not targetSlot then
+                warn("ล็อกเกอร์เต็มแล้ว!")
+                break
+            end
+            
+            humanoid:EquipTool(item)
+            task.wait(0.3)
+            
+            -- เลื่อน ScrollingFrame ไปยังตำแหน่งของช่องฝากที่เลือกเพื่อให้แสดงผลบนหน้าจอและคลิกได้ถูกต้อง
+            pcall(function()
+                local relativeY = targetSlot.AbsolutePosition.Y - scrollingFrame.AbsolutePosition.Y + scrollingFrame.CanvasPosition.Y
+                local targetScrollY = math.max(0, relativeY - (scrollingFrame.AbsoluteSize.Y / 2))
+                scrollingFrame.CanvasPosition = Vector2.new(0, targetScrollY)
+            end)
+            task.wait(0.2)
+            
+            -- ค้นหาปุ่มจริงๆ ภายใน Card เพื่อคลิกฝาก
+            local clickTarget = targetSlot:FindFirstChildOfClass("ImageButton") or targetSlot:FindFirstChild("Button") or targetSlot
+            safeClick(clickTarget)
+            task.wait(0.5)
+        end
+        
+        local exitBtn = lockerGui:FindFirstChild("Exit", true) or lockerGui:FindFirstChild("Close", true)
+        if exitBtn then
+            safeClick(exitBtn)
+            task.wait(0.5)
+        end
+        
+        print("การฝากของเสร็จสมบูรณ์")
+    end)
+    if not success then
+        warn("เกิดข้อผิดพลาดในการฝากของ: " .. tostring(err))
+    end
+    isDepositing = false
+end
+
+-- ฟังก์ชันสำหรับขายไอเทมตามเกรดที่เลือก
+local function SellSelectedItems(isManual)
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then return end
+    
+    local inventoryIndices = {}
+    
+    -- 1. ตรวจสอบอาวุธใน Backpack
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") then
+            local rarity = GetRarity(item)
+            local invIndex = item:GetAttribute("inventoryIndex")
+            local isFav = item:GetAttribute("Favorited")
+            local category = item:GetAttribute("Category")
+            
+            if invIndex and category == "Weapon" and SelectedSellRarities[rarity] and not isFav then
+                table.insert(inventoryIndices, invIndex)
+            end
+        end
+    end
+    
+    -- 2. ตรวจสอบอาวุธที่ติดตั้งอยู่ (Character)
+    local char = LocalPlayer.Character
+    if char then
+        local equippedTool = char:FindFirstChildOfClass("Tool")
+        if equippedTool then
+            local rarity = GetRarity(equippedTool)
+            local invIndex = equippedTool:GetAttribute("inventoryIndex")
+            local isFav = equippedTool:GetAttribute("Favorited")
+            local category = equippedTool:GetAttribute("Category")
+            
+            if invIndex and category == "Weapon" and SelectedSellRarities[rarity] and not isFav then
+                table.insert(inventoryIndices, invIndex)
+            end
+        end
+    end
+    
+    if #inventoryIndices == 0 then
+        if isManual then
+            print("ไม่มีปืนเกรดที่เลือกขายในกระเป๋า")
+        end
+        return
+    end
+    
+    -- 3. เรียกใช้งาน RemoteFunction เพื่อขาย
+    pcall(function()
+        local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+        local sellRemote = remotes and remotes:FindFirstChild("ClientSellRequest")
+        
+        if sellRemote and sellRemote:IsA("RemoteFunction") then
+            print("กำลังขายปืนจำนวน " .. tostring(#inventoryIndices) .. " ชิ้น...")
+            local payout = sellRemote:InvokeServer(inventoryIndices)
+            if payout then
+                print("ขายสำเร็จ! ได้รับเงิน: " .. tostring(payout))
+            end
+        else
+            warn("ไม่พบ RemoteFunction: ClientSellRequest")
+        end
+    end)
+end
+
+-- [ 4. สร้าง UI Elements ด้วย EmperUI ]
+MainLeft:Toggle({
+    Title = "Auto Farm",
+    Desc = "เปิดบอทฟาร์มเก็บกล่องและเก็บไอเทมดรอปบนพื้นรอบแผนที่ออโต้",
+    Default = false,
+    Callback = function(state)
+        AutoFarmEnabled = state
+    end
+})
+
+MainLeft:Dropdown({
+    Title = "Min Deposit Rarity",
+    Desc = "ระดับความหายากขั้นต่ำที่จะฝากเข้าตู้เซฟล็อกเกอร์",
+    Values = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Trancendent", "Emerald", "Voltaic"},
+    Value = "Mythic",
+    Callback = function(name)
+        MIN_DEPOSIT_RARITY = RarityNameToValue[name] or 6
+    end
+})
+
+MainLeft:Divider()
+
+MainLeft:Toggle({
+    Title = "Auto Sell Items",
+    Desc = "ขายไอเทมตามระดับความหายากที่เลือกอัตโนมัติหลังฟาร์ม",
+    Default = false,
+    Callback = function(state)
+        AutoSellEnabled = state
+        if state then
+            task.spawn(function()
+                SellSelectedItems(true)
+            end)
+        end
+    end
+})
+
+MainLeft:MultiDropdown({
+    Title = "Rarities to Sell",
+    Values = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Divine", "Trancendent", "Emerald", "Voltaic"},
+    Value = {"Common", "Uncommon", "Rare", "Epic", "Legendary"},
+    Callback = function(selected)
+        SelectedSellRarities = {}
+        for _, name in ipairs(selected) do
+            local val = RarityNameToValue[name]
+            if val then
+                SelectedSellRarities[val] = true
+            end
+        end
+        -- สั่งขายทันทีเพื่อให้การเปลี่ยนแปลงตัวเลือกมีผลเลย
+        if AutoSellEnabled then
+            task.spawn(function()
+                SellSelectedItems(true)
+            end)
+        end
+    end
+})
+
+MainLeft:Button({
+    Title = "Sell Selected Now",
+    Desc = "สั่งขายไอเทมในกระเป๋าที่ระดับเกรดตรงกันทันที",
+    Callback = function()
+        SellSelectedItems(true)
+    end
+})
+
+local statusLabel = MainRight:Label("<font color='#7F8C8D'>⚪ Auto Farm: Disabled</font>")
+
+local function setStatus(text)
+    if statusLabel then
+        pcall(function()
+            statusLabel:SetText(text)
+        end)
+    end
+end
+
+-- [ 5. ลูปทำงานฟาร์มเบื้องหลัง ]
+task.spawn(function()
+    local previouslyLooting = false
+    while true do
+        task.wait(0.5)
+        if getgenv().TheArmory_ScriptId ~= scriptId then break end
+        
+        if AutoFarmEnabled then
+            if isDepositing then
+                task.wait(0.5)
+                continue
+            end
+            
+            local char = LocalPlayer.Character
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            
+            if not char or not hrp or (humanoid and humanoid.Health <= 0) then
+                continue
+            end
+
+            if not previouslyLooting then
+                previouslyLooting = true
+                setStatus("<font color='#F1C40F'>🟡 Teleporting for ground looting...</font>")
+                _G.TeleportToZone() 
+                task.wait(2.0)
+            end
+            
+            char = LocalPlayer.Character
+            hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if not hrp then continue end
+
+            local lootedAny = false
+            
+            -- 1. เคลียร์และเปิดกล่องก่อน
+            local spawnedCrates = workspace:FindFirstChild("SpawnedCrates")
+            local crates = spawnedCrates and spawnedCrates:GetChildren() or {}
+            
+            for _, crate in ipairs(crates) do
+                if not AutoFarmEnabled or isDepositing then break end
+                if not char or not char.Parent or not hrp or not hrp.Parent then break end
+                
+                local cratePrompt = crate:FindFirstChild("Prompt") 
+                    or crate:FindFirstChildWhichIsA("ProximityPrompt") 
+                    or crate:FindFirstChildOfClass("ProximityPrompt")
+                
+                if not cratePrompt then
+                    for _, desc in ipairs(crate:GetDescendants()) do
+                        if desc:IsA("ProximityPrompt") then
+                            cratePrompt = desc
+                            break
+                        end
+                    end
+                end
+                
+                if cratePrompt and cratePrompt.Enabled then
+                    local targetPart = crate:IsA("BasePart") and crate or crate:FindFirstChildWhichIsA("BasePart")
+                    if targetPart then
+                        lootedAny = true
+                        setStatus("<font color='#F1C40F'>🟡 Crates: Opening " .. crate.Name .. "...</font>")
+                        
+                        hrp.CFrame = targetPart.CFrame
+                        task.wait(0.4)
+                        
+                        if not AutoFarmEnabled or isDepositing then break end
+                        
+                        -- กดปุ่ม E สูงสุด 5 ครั้ง ห่างกันครั้งละ 0.5 วินาที
+                        for attempt = 1, 5 do
+                            if not crate or not crate.Parent or not AutoFarmEnabled or isDepositing then break end
+                            FireLootPrompt(cratePrompt)
+                            task.wait(0.5)
+                        end
+                        
+                        -- ตรวจสอบว่ามีของแรร์เข้าตัวจากการเปิดกล่องหรือไม่
+                        local backpack = LocalPlayer:FindFirstChild("Backpack")
+                        local hasHighRarity = false
+                        if backpack then
+                            for _, bpItem in ipairs(backpack:GetChildren()) do
+                                if bpItem:IsA("Tool") then
+                                    local rarity = GetRarity(bpItem)
+                                    if rarity >= MIN_DEPOSIT_RARITY then
+                                        hasHighRarity = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        
+                        if hasHighRarity and AutoFarmEnabled then
+                            setStatus("<font color='#F1C40F'>🟡 Found Rare Item! Depositing...</font>")
+                            DepositLocker()
+                        end
+                        
+                        if hrp and hrp.Parent then
+                            hrp.CFrame = getLockerCFrame()
+                        end
+                        task.wait(0.4)
+                    end
+                end
+            end
+            
+            -- 2. เคลียร์ไอเทมดรอปบนพื้น
+            local spawnedItems = workspace:FindFirstChild("SpawnedItems")
+            local items = spawnedItems and spawnedItems:GetChildren() or {}
+            
+            setStatus(string.format("<font color='#F1C40F'>🟡 Looting: Scanning %d drops...</font>", #items))
+            
+            for _, item in ipairs(items) do
+                if not AutoFarmEnabled or isDepositing then break end
+                if not char or not char.Parent or not hrp or not hrp.Parent then break end
+                
+                local itemPrompt = item:FindFirstChild("Prompt") or item:FindFirstChildWhichIsA("ProximityPrompt")
+                if item and item.Parent and itemPrompt and itemPrompt.Enabled then
+                    local targetPart = item:IsA("BasePart") and item or item:FindFirstChildWhichIsA("BasePart")
+                    
+                    if targetPart then
+                        lootedAny = true
+                        
+                        hrp.CFrame = targetPart.CFrame
+                        task.wait(0.4)
+                        
+                        if not AutoFarmEnabled or isDepositing then break end
+                        
+                        -- กดปุ่ม E สูงสุด 5 ครั้ง ห่างกันครั้งละ 0.5 วินาที
+                        for attempt = 1, 5 do
+                            if not item or not item.Parent or not AutoFarmEnabled or isDepositing then break end
+                            FireLootPrompt(itemPrompt)
+                            task.wait(0.5)
+                        end
+                        
+                        if item and item.Parent then
+                            setStatus("<font color='#E74C3C'>❌ Stuck! Skipping...</font>")
+                            task.wait(0.3)
+                        else
+                            -- แสดงว่าเก็บสำเร็จ ให้สแกนหาของระดับแรร์ในกระเป๋าทันที
+                            local backpack = LocalPlayer:FindFirstChild("Backpack")
+                            local hasHighRarity = false
+                            if backpack then
+                                for _, bpItem in ipairs(backpack:GetChildren()) do
+                                    if bpItem:IsA("Tool") then
+                                        local rarity = GetRarity(bpItem)
+                                        if rarity >= MIN_DEPOSIT_RARITY then
+                                            hasHighRarity = true
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                            
+                            if hasHighRarity and AutoFarmEnabled then
+                                setStatus("<font color='#F1C40F'>🟡 Found Rare Item! Depositing...</font>")
+                                DepositLocker()
+                            end
+                        end
+                        
+                        if hrp and hrp.Parent then
+                            hrp.CFrame = getLockerCFrame()
+                        end
+                        task.wait(0.4)
+                    end
+                end
+            end
+            
+            -- ตรวจเช็คขั้นสุดท้ายเพื่อฝากของแรร์ที่อาจหลงเหลือ
+            local backpack = LocalPlayer:FindFirstChild("Backpack")
+            local hasHighRarity = false
+            if backpack then
+                for _, bpItem in ipairs(backpack:GetChildren()) do
+                    if bpItem:IsA("Tool") then
+                        local rarity = GetRarity(bpItem)
+                        if rarity >= MIN_DEPOSIT_RARITY then
+                            hasHighRarity = true
+                            break
+                        end
+                    end
+                end
+            end
+            
+            if hasHighRarity and AutoFarmEnabled then
+                DepositLocker()
+            end
+            
+            if AutoSellEnabled and AutoFarmEnabled then
+                SellSelectedItems()
+            end
+            
+            if AutoFarmEnabled then 
+                setStatus("<font color='#2ECC71'>🟢 Auto Farm: Scanning...</font>") 
+            end
+        else
+            previouslyLooting = false
+            setStatus("<font color='#7F8C8D'>⚪ Auto Farm: Disabled</font>")
+        end
+    end
+end)
+
+-- [ 6. ลูปตรวจสอบความปลอดภัยระดับแรร์ออโต้ (Global Auto-Deposit Watcher) ]
+task.spawn(function()
+    while true do
+        task.wait(0.2)
+        if getgenv().TheArmory_ScriptId ~= scriptId then break end
+        
+        local char = LocalPlayer.Character
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        
+        if char and backpack and humanoid and humanoid.Health > 0 and not isDepositing then
+            local hasHighRarity = false
+            
+            -- ตรวจสอบใน Backpack
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") then
+                    local rarity = GetRarity(item)
+                    if rarity >= MIN_DEPOSIT_RARITY then
+                        hasHighRarity = true
+                        break
+                    end
+                end
+            end
+            
+            -- ตรวจสอบใน Character (เผื่อติดตั้งใช้งานอยู่)
+            if not hasHighRarity then
+                for _, item in ipairs(char:GetChildren()) do
+                    if item:IsA("Tool") then
+                        local rarity = GetRarity(item)
+                        if rarity >= MIN_DEPOSIT_RARITY then
+                            hasHighRarity = true
+                            break
+                        end
+                    end
+                end
+            end
+            
+            if hasHighRarity then
+                setStatus("<font color='#E74C3C'>🚨 Safe Item Detected! Teleporting to Safe Locker...</font>")
+                DepositLocker()
+            end
+        end
+    end
+end)
+
+-- [ 7. ลูปขายไอเทมออโต้ (Global Auto-Sell Watcher) ]
+task.spawn(function()
+    while true do
+        task.wait(1.0)
+        if getgenv().TheArmory_ScriptId ~= scriptId then break end
+        
+        if AutoSellEnabled and not isDepositing then
+            local char = LocalPlayer.Character
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            if char and humanoid and humanoid.Health > 0 then
+                SellSelectedItems(false)
+            end
+        end
+    end
+end)
