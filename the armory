@@ -96,6 +96,25 @@ local MIN_DEPOSIT_RARITY = 6
 local AutoSellEnabled = false
 local SelectedSellRarities = { [1] = true, [2] = true, [3] = true, [4] = true, [5] = true }
 local isDepositing = false
+local AutoDropUtilities = true
+local previouslyLooting = false
+
+-- ฟังก์ชันตรวจสอบว่าเป็นคีย์การ์ดหรือยาสลบ
+local function isUtilityItem(item)
+    if not item then return false end
+    local model = item:FindFirstChildOfClass("Model") or item:FindFirstChildWhichIsA("Model")
+    if model then
+        local name = model.Name:lower()
+        if name:find("solution") or name:find("keycard") or name:find("key") then
+            return true
+        end
+    end
+    local itemName = item.Name:lower()
+    if itemName:find("solution") or itemName:find("keycard") or itemName:find("key") then
+        return true
+    end
+    return false
+end
 
 local RarityNameToValue = {
     ["Common"] = 1,
@@ -148,6 +167,91 @@ end
 local GetRarity = GetRarityFromItem or function(item) 
     if not item then return 0 end
     return item:GetAttribute("Rarity") or 5 
+end
+
+-- ฟังก์ชันตรวจสอบว่ากระเป๋าเต็มหรือไม่ (เก็บอาวุธ 3 ชิ้นให้วาร์ปไปขาย หรือไอเทมรวม 6 ชิ้น)
+local function isInventoryFull()
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local char = LocalPlayer.Character
+    
+    -- เช็คโซนปัจจุบัน (ดูว่าอยู่ใกล้จุด Locker ใน Safe Zone หรือไม่)
+    local inSafe = false
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local lockerCF = getLockerCFrame()
+        if (hrp.Position - lockerCF.Position).Magnitude < 200 then
+            inSafe = true
+        end
+    end
+
+    if inSafe then
+        -- 🌟 [Safe Zone] ตรวจเช็คจากไอเทมจริง (Tools) ใน Backpack และ Character
+        local weaponCount = 0
+        local totalItems = 0
+        
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") then
+                    totalItems = totalItems + 1
+                    local category = item:GetAttribute("Category")
+                    if category == "Weapon" then
+                        weaponCount = weaponCount + 1
+                    end
+                end
+            end
+        end
+        if char then
+            for _, item in ipairs(char:GetChildren()) do
+                if item:IsA("Tool") then
+                    totalItems = totalItems + 1
+                    local category = item:GetAttribute("Category")
+                    if category == "Weapon" then
+                        weaponCount = weaponCount + 1
+                    end
+                end
+            end
+        end
+        
+        -- ดึงขนาดกระเป๋าสูงสุดจาก UI (หรือดีฟอลต์เป็น 6)
+        local maxCapacity = 6
+        local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+        local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+        local display = frame and frame:FindFirstChild("FillDisplay")
+        if display then
+            local _, max = display.Text:match("(%d+)/(%d+)")
+            if max then
+                maxCapacity = tonumber(max)
+            end
+        end
+        
+        -- เต็มเมื่อมีอาวุธจริงในตัว >= 3 ชิ้น หรือจำนวนรวมจริง >= ขนาดกระเป๋า
+        return weaponCount >= 3 or totalItems >= maxCapacity
+    else
+        -- 🌟 [Auto Farm / Combat Zone] ตรวจเช็คจาก UI InventoryGUI (เนื่องจากปืนดรอปในดันเจี้ยนยังไม่ถูกแปลงเป็น Tool ในตัว)
+        local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+        local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+        local display = frame and frame:FindFirstChild("FillDisplay")
+        
+        if display and frame then
+            local text = display.Text
+            local current, max = text:match("(%d+)/(%d+)")
+            if current and max then
+                local trueTotal = tonumber(current)
+                local trueMax = tonumber(max)
+                
+                -- นับจำนวนอาวุธจาก UI Prefab โดยตรง
+                local weaponCount = 0
+                for _, child in ipairs(frame:GetChildren()) do
+                    if child.Name == "Prefab" then
+                        weaponCount = weaponCount + 1
+                    end
+                end
+                
+                return weaponCount >= 3 or trueTotal >= trueMax
+            end
+        end
+    end
+    return false
 end
 
 -- ฟังก์ชันจำลองการคลิก GUI
@@ -203,19 +307,33 @@ local function findLockerPrompt()
     return nil
 end
 
--- ฟังก์ชันส่งการกด Prompt
+-- ฟังก์ชันส่งการกด Prompt (รองรับ PC และ Mobile แบบ 100%)
 local function FireLootPrompt(prompt)
     if not prompt then return end
     pcall(function()
         prompt.RequiresLineOfSight = false
+        -- ปรับแต่งระยะกดให้ไกลขึ้นชั่วคราวเพื่อป้องกันกดไม่ติดตอน desync
+        if prompt.MaxActivationDistance < 20 then
+            prompt.MaxActivationDistance = 20
+        end
     end)
-    if fireproximityprompt then
-        fireproximityprompt(prompt)
-    else
+    
+    local fired = false
+    -- 1. ลองใช้ fireproximityprompt (มาตรฐานสำหรับ Executor ส่วนใหญ่)
+    pcall(function()
+        if fireproximityprompt then
+            fireproximityprompt(prompt)
+            fired = true
+        end
+    end)
+    
+    -- 2. แผนสำรอง: จำลองการกดปุ่มทางกายภาพผ่านคีย์บอร์ด (แก้ไขปัญหาใน Mobile บางตัวที่ไม่รองรับ fireproximityprompt)
+    if not fired then
         pcall(function()
-            prompt:InputHoldBegin()
+            local keyCode = prompt.KeyboardKeyCode or Enum.KeyCode.E
+            VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
             task.wait(prompt.HoldDuration or 0.1)
-            prompt:InputHoldEnd()
+            VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
         end)
     end
 end
@@ -335,6 +453,11 @@ local function DepositLocker()
         end
         
         print("การฝากของเสร็จสมบูรณ์")
+        
+        -- ป้องกันการวาร์ปซ้ำซ้อนและหน่วงเวลา 10 วินาทีตามต้องการ
+        previouslyLooting = false
+        setStatus("<font color='#2ECC71'>🟢 Locker Deposit complete! Waiting 10s...</font>")
+        task.wait(10.0)
     end)
     if not success then
         warn("เกิดข้อผิดพลาดในการฝากของ: " .. tostring(err))
@@ -345,7 +468,7 @@ end
 -- ฟังก์ชันสำหรับขายไอเทมตามเกรดที่เลือก
 local function SellSelectedItems(isManual)
     local backpack = LocalPlayer:FindFirstChild("Backpack")
-    if not backpack then return end
+    if not backpack then return false end
     
     local inventoryIndices = {}
     
@@ -383,9 +506,10 @@ local function SellSelectedItems(isManual)
         if isManual then
             print("ไม่มีปืนเกรดที่เลือกขายในกระเป๋า")
         end
-        return
+        return false
     end
     
+    local soldSuccess = false
     -- 3. เรียกใช้งาน RemoteFunction เพื่อขาย
     pcall(function()
         local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
@@ -394,22 +518,126 @@ local function SellSelectedItems(isManual)
         if sellRemote and sellRemote:IsA("RemoteFunction") then
             print("กำลังขายปืนจำนวน " .. tostring(#inventoryIndices) .. " ชิ้น...")
             local payout = sellRemote:InvokeServer(inventoryIndices)
-            if payout then
+            if payout ~= nil then
                 print("ขายสำเร็จ! ได้รับเงิน: " .. tostring(payout))
+                soldSuccess = true
             end
         else
             warn("ไม่พบ RemoteFunction: ClientSellRequest")
         end
     end)
+    return soldSuccess
 end
 
 -- [ 4. สร้าง UI Elements ด้วย EmperUI ]
+local inventoryLabel = MainLeft:Label("<font color='#7F8C8D'>🎒 Inventory: Loading...</font>")
+
+local function getInventoryStatusString()
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local char = LocalPlayer.Character
+    
+    -- เช็คโซนปัจจุบัน (ดูว่าอยู่ใกล้จุด Locker ใน Safe Zone หรือไม่)
+    local inSafe = false
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local lockerCF = getLockerCFrame()
+        if (hrp.Position - lockerCF.Position).Magnitude < 200 then
+            inSafe = true
+        end
+    end
+
+    if inSafe then
+        local weaponCount = 0
+        local totalItems = 0
+        
+        if backpack then
+            for _, item in ipairs(backpack:GetChildren()) do
+                if item:IsA("Tool") then
+                    totalItems = totalItems + 1
+                    local category = item:GetAttribute("Category")
+                    if category == "Weapon" then
+                        weaponCount = weaponCount + 1
+                    end
+                end
+            end
+        end
+        if char then
+            for _, item in ipairs(char:GetChildren()) do
+                if item:IsA("Tool") then
+                    totalItems = totalItems + 1
+                    local category = item:GetAttribute("Category")
+                    if category == "Weapon" then
+                        weaponCount = weaponCount + 1
+                    end
+                end
+            end
+        end
+        
+        local maxCapacity = 6
+        local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+        local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+        local display = frame and frame:FindFirstChild("FillDisplay")
+        if display then
+            local _, max = display.Text:match("(%d+)/(%d+)")
+            if max then
+                maxCapacity = tonumber(max)
+            end
+        end
+        
+        return string.format("<font color='#3498DB'>🎒 Safe Zone Bag: %d/%d (Weapons: %d/3)</font>", totalItems, maxCapacity, weaponCount)
+    else
+        local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+        local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+        local display = frame and frame:FindFirstChild("FillDisplay")
+        
+        if display and frame then
+            local text = display.Text
+            local current, max = text:match("(%d+)/(%d+)")
+            if current and max then
+                local trueTotal = tonumber(current)
+                local trueMax = tonumber(max)
+                
+                local weaponCount = 0
+                for _, child in ipairs(frame:GetChildren()) do
+                    if child.Name == "Prefab" then
+                        weaponCount = weaponCount + 1
+                    end
+                end
+                
+                return string.format("<font color='#2ECC71'>🎒 Dungeon Bag: %d/%d (Weapons: %d/3)</font>", trueTotal, trueMax, weaponCount)
+            end
+        end
+        return "<font color='#7F8C8D'>🎒 Inventory: N/A</font>"
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if getgenv().TheArmory_ScriptId ~= scriptId then break end
+        if inventoryLabel then
+            pcall(function()
+                inventoryLabel:SetText(getInventoryStatusString())
+            end)
+        end
+    end
+end)
+
 MainLeft:Toggle({
     Title = "Auto Farm",
     Desc = "เปิดบอทฟาร์มเก็บกล่องและเก็บไอเทมดรอปบนพื้นรอบแผนที่ออโต้",
     Default = false,
     Callback = function(state)
         AutoFarmEnabled = state
+    end
+})
+
+MainLeft:Toggle({
+    Title = "Auto Drop Utilities",
+    Desc = "ทิ้งคีย์การ์ดและยาสลบอัตโนมัติเพื่อป้องกันไม่ให้กระเป๋าเต็ม",
+    Default = true,
+    Callback = function(state)
+        AutoDropUtilities = state
     end
 })
 
@@ -479,8 +707,9 @@ local function setStatus(text)
 end
 
 -- [ 5. ลูปทำงานฟาร์มเบื้องหลัง ]
+local blacklistedCrates = {}
 task.spawn(function()
-    local previouslyLooting = false
+    previouslyLooting = false
     while true do
         task.wait(0.5)
         if getgenv().TheArmory_ScriptId ~= scriptId then break end
@@ -496,6 +725,67 @@ task.spawn(function()
             local hrp = char and char:FindFirstChild("HumanoidRootPart")
             
             if not char or not hrp or (humanoid and humanoid.Health <= 0) then
+                continue
+            end
+
+            -- ตรวจสอบว่ากระเป๋าเต็ม (6/6) หรือไม่ก่อนเริ่มฟาร์ม
+            if isInventoryFull() then
+                previouslyLooting = false -- รีเซ็ตสถานะเพื่อให้วาร์ปเข้าแมพใหม่เมื่อกลับไปฟาร์ม
+                setStatus("<font color='#E74C3C'>🚨 Inventory Full! Teleporting to sell...</font>")
+                hrp.CFrame = getLockerCFrame()
+                task.wait(0.6)
+                
+                -- สั่งขายปืนเกรดที่เลือก
+                local sold = SellSelectedItems(true)
+                task.wait(0.6)
+                
+                -- ถ้าขายสำเร็จ ไม่ต้องสนใจค่าเศษของใน UI (เช่น 3/6 หรือดีเลย์ของเซิร์ฟเวอร์) ให้ไปเก็บต่อได้เลย
+                if sold then
+                    setStatus("<font color='#2ECC71'>🟢 Selling complete! Waiting 5s before farming...</font>")
+                    task.wait(5.0)
+                else
+                    -- ตรวจสอบอีกครั้งกรณีไม่ได้ขาย (เช่น ไม่มีของเกรดที่เลือก)
+                    if isInventoryFull() then
+                        -- ตรวจสอบเผื่อมีของแรร์ให้ฝากล็อกเกอร์
+                        local backpack = LocalPlayer:FindFirstChild("Backpack")
+                        local hasHighRarity = false
+                        if backpack then
+                            for _, bpItem in ipairs(backpack:GetChildren()) do
+                                if bpItem:IsA("Tool") then
+                                    local rarity = GetRarity(bpItem)
+                                    if rarity >= MIN_DEPOSIT_RARITY then
+                                        hasHighRarity = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if not hasHighRarity and char then
+                            for _, charItem in ipairs(char:GetChildren()) do
+                                if charItem:IsA("Tool") then
+                                    local rarity = GetRarity(charItem)
+                                    if rarity >= MIN_DEPOSIT_RARITY then
+                                        hasHighRarity = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        
+                        if hasHighRarity then
+                            setStatus("<font color='#F1C40F'>🟡 Inventory Full but has Rare Items! Depositing...</font>")
+                            DepositLocker()
+                            task.wait(0.5)
+                        else
+                            setStatus("<font color='#E74C3C'>⚠️ Inventory full with kept items! Clear manually.</font>")
+                            task.wait(3.0)
+                        end
+                    else
+                        -- ขายเสร็จและกระเป๋าว่างแล้ว ให้รอ 5 วินาทีก่อนกลับไปฟาร์ม
+                        setStatus("<font color='#2ECC71'>🟢 Selling complete! Waiting 5s before farming...</font>")
+                        task.wait(5.0)
+                    end
+                end
                 continue
             end
 
@@ -517,8 +807,11 @@ task.spawn(function()
             local crates = spawnedCrates and spawnedCrates:GetChildren() or {}
             
             for _, crate in ipairs(crates) do
-                if not AutoFarmEnabled or isDepositing then break end
+                if not AutoFarmEnabled or isDepositing or isInventoryFull() then break end
                 if not char or not char.Parent or not hrp or not hrp.Parent then break end
+                
+                -- ตรวจสอบแบล็คลิสต์กล่องที่เปิดไม่ได้
+                if blacklistedCrates[crate] then continue end
                 
                 local cratePrompt = crate:FindFirstChild("Prompt") 
                     or crate:FindFirstChildWhichIsA("ProximityPrompt") 
@@ -539,16 +832,96 @@ task.spawn(function()
                         lootedAny = true
                         setStatus("<font color='#F1C40F'>🟡 Crates: Opening " .. crate.Name .. "...</font>")
                         
-                        hrp.CFrame = targetPart.CFrame
+                        -- วาร์ปอยู่เหนือกล่องเล็กน้อย 2.5 studs เพื่อเลี่ยงการติดโมเดล/กล้องบั๊กบนโทรศัพท์
+                        hrp.CFrame = targetPart.CFrame * CFrame.new(0, 2.5, 0)
                         task.wait(0.4)
                         
-                        if not AutoFarmEnabled or isDepositing then break end
+                        if not AutoFarmEnabled or isDepositing or isInventoryFull() then break end
                         
-                        -- กดปุ่ม E สูงสุด 5 ครั้ง ห่างกันครั้งละ 0.5 วินาที
+                        -- ขั้นตอนที่ 1: กดปุ่มเปิดกล่อง (สูงสุด 5 ครั้ง ห่างกันครั้งละ 0.5 วินาที หรือจนกว่าจะเปิดสำเร็จ)
+                        local openedSuccessfully = false
                         for attempt = 1, 5 do
-                            if not crate or not crate.Parent or not AutoFarmEnabled or isDepositing then break end
+                            if not crate or not crate.Parent or not AutoFarmEnabled or isDepositing or not cratePrompt.Enabled then break end
                             FireLootPrompt(cratePrompt)
                             task.wait(0.5)
+                            if not cratePrompt.Enabled then
+                                openedSuccessfully = true
+                                break
+                            end
+                        end
+                        
+                        -- หากพยายามกดเปิด 5 ครั้งแล้วยังไม่เปิด (ปุ่มยังอยู่และไม่เข้าสถานะเปิดสำเร็จ)
+                        -- ให้แบล็คลิสต์กล่องนี้ไว้เพื่อข้ามในลูปครั้งต่อไป ไม่ต้องค้างอยู่ตรงนี้
+                        if cratePrompt and cratePrompt.Enabled and not openedSuccessfully then
+                            blacklistedCrates[crate] = true
+                            setStatus("<font color='#E74C3C'>❌ Crate Locked! Blacklisting...</font>")
+                            task.wait(0.4)
+                            continue
+                        end
+                        
+                        -- ขั้นตอนที่ 2: รอให้ของสปอว์นออกมาจากกล่อง (เช็คใน workspace.SpawnedItems)
+                        local spawnedItemPrompt = nil
+                        local spawnedItem = nil
+                        
+                        for i = 1, 15 do -- รอสูงสุด 3.0 วินาที
+                            if not AutoFarmEnabled or isDepositing or not crate or not crate.Parent then break end
+                            
+                            local spawnedItems = workspace:FindFirstChild("SpawnedItems")
+                            if spawnedItems then
+                                for _, item in ipairs(spawnedItems:GetChildren()) do
+                                    local itemPart = item:IsA("BasePart") and item or item:FindFirstChildWhichIsA("BasePart")
+                                    if itemPart and (itemPart.Position - targetPart.Position).Magnitude <= 12 then
+                                        local prompt = item:FindFirstChild("Prompt") or item:FindFirstChildWhichIsA("ProximityPrompt")
+                                        if prompt and prompt.Enabled then
+                                            -- ข้ามไอเทมประเภทคีย์การ์ด/ยาสลบ
+                                            if not (AutoDropUtilities and isUtilityItem(item)) then
+                                                spawnedItem = item
+                                                spawnedItemPrompt = prompt
+                                                break
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                            if spawnedItemPrompt then break end
+                            task.wait(0.2)
+                        end
+                        
+                        -- ขั้นตอนที่ 3: ถ้าเจอของที่ดรอปออกมาจากกล่อง ให้เก็บทันที
+                        if spawnedItemPrompt and spawnedItem then
+                            setStatus("<font color='#F1C40F'>🟡 Crates: Taking Spawned Item...</font>")
+                            local itemPart = spawnedItem:IsA("BasePart") and spawnedItem or spawnedItem:FindFirstChildWhichIsA("BasePart")
+                            if itemPart then
+                                hrp.CFrame = itemPart.CFrame * CFrame.new(0, 1.5, 0)
+                                task.wait(0.3)
+                                
+                                local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+                                local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+                                local display = frame and frame:FindFirstChild("FillDisplay")
+                                local oldText = display and display.Text or ""
+                                local looted = false
+                                
+                                for attempt = 1, 5 do
+                                    if not spawnedItem or not spawnedItem.Parent or not AutoFarmEnabled or isDepositing or not spawnedItemPrompt.Enabled or isInventoryFull() then break end
+                                    FireLootPrompt(spawnedItemPrompt)
+                                    task.wait(0.5)
+                                    if not spawnedItem or not spawnedItem.Parent then
+                                        looted = true
+                                        break
+                                    end
+                                end
+                                
+                                if looted then
+                                    -- รอให้ UI อัปเดตข้อมูลจำนวนไอเทมสูงสุด 1.5 วินาที เพื่อป้องกันความล่าช้าของเน็ตเวิร์ก
+                                    local startWait = tick()
+                                    while tick() - startWait < 1.5 do
+                                        if display and display.Text ~= oldText then
+                                            break
+                                        end
+                                        task.wait(0.1)
+                                    end
+                                end
+                            end
                         end
                         
                         -- ตรวจสอบว่ามีของแรร์เข้าตัวจากการเปิดกล่องหรือไม่
@@ -570,11 +943,7 @@ task.spawn(function()
                             setStatus("<font color='#F1C40F'>🟡 Found Rare Item! Depositing...</font>")
                             DepositLocker()
                         end
-                        
-                        if hrp and hrp.Parent then
-                            hrp.CFrame = getLockerCFrame()
-                        end
-                        task.wait(0.4)
+                        task.wait(0.2)
                     end
                 end
             end
@@ -586,8 +955,13 @@ task.spawn(function()
             setStatus(string.format("<font color='#F1C40F'>🟡 Looting: Scanning %d drops...</font>", #items))
             
             for _, item in ipairs(items) do
-                if not AutoFarmEnabled or isDepositing then break end
+                if not AutoFarmEnabled or isDepositing or isInventoryFull() then break end
                 if not char or not char.Parent or not hrp or not hrp.Parent then break end
+                
+                -- ข้ามคีย์การ์ดและยาสลบ
+                if AutoDropUtilities and isUtilityItem(item) then
+                    continue
+                end
                 
                 local itemPrompt = item:FindFirstChild("Prompt") or item:FindFirstChildWhichIsA("ProximityPrompt")
                 if item and item.Parent and itemPrompt and itemPrompt.Enabled then
@@ -596,22 +970,39 @@ task.spawn(function()
                     if targetPart then
                         lootedAny = true
                         
-                        hrp.CFrame = targetPart.CFrame
+                        -- วาร์ปอยู่เหนือของเล็กน้อย 1.5 studs เลี่ยงการจมดิน
+                        hrp.CFrame = targetPart.CFrame * CFrame.new(0, 1.5, 0)
                         task.wait(0.4)
                         
                         if not AutoFarmEnabled or isDepositing then break end
                         
+                        local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+                        local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+                        local display = frame and frame:FindFirstChild("FillDisplay")
+                        local oldText = display and display.Text or ""
+                        local looted = false
+                        
                         -- กดปุ่ม E สูงสุด 5 ครั้ง ห่างกันครั้งละ 0.5 วินาที
                         for attempt = 1, 5 do
-                            if not item or not item.Parent or not AutoFarmEnabled or isDepositing then break end
+                            if not item or not item.Parent or not AutoFarmEnabled or isDepositing or not itemPrompt.Enabled or isInventoryFull() then break end
                             FireLootPrompt(itemPrompt)
                             task.wait(0.5)
+                            if not item or not item.Parent then
+                                looted = true
+                                break
+                            end
                         end
                         
-                        if item and item.Parent then
-                            setStatus("<font color='#E74C3C'>❌ Stuck! Skipping...</font>")
-                            task.wait(0.3)
-                        else
+                        if looted then
+                            -- รอให้ UI อัปเดตข้อมูลจำนวนไอเทมสูงสุด 1.5 วินาที เพื่อป้องกันความล่าช้าของเน็ตเวิร์ก
+                            local startWait = tick()
+                            while tick() - startWait < 1.5 do
+                                if display and display.Text ~= oldText then
+                                    break
+                                end
+                                task.wait(0.1)
+                            end
+                            
                             -- แสดงว่าเก็บสำเร็จ ให้สแกนหาของระดับแรร์ในกระเป๋าทันที
                             local backpack = LocalPlayer:FindFirstChild("Backpack")
                             local hasHighRarity = false
@@ -631,12 +1022,13 @@ task.spawn(function()
                                 setStatus("<font color='#F1C40F'>🟡 Found Rare Item! Depositing...</font>")
                                 DepositLocker()
                             end
+                        else
+                            if item and item.Parent then
+                                setStatus("<font color='#E74C3C'>❌ Stuck! Skipping...</font>")
+                                task.wait(0.3)
+                            end
                         end
-                        
-                        if hrp and hrp.Parent then
-                            hrp.CFrame = getLockerCFrame()
-                        end
-                        task.wait(0.4)
+                        task.wait(0.2)
                     end
                 end
             end
@@ -658,6 +1050,12 @@ task.spawn(function()
             
             if hasHighRarity and AutoFarmEnabled then
                 DepositLocker()
+            end
+            
+            -- หลังจากลูปเก็บทุกอย่างเสร็จสิ้นในรอบนั้น ให้กลับมารอที่ล็อกเกอร์เพื่อความปลอดภัย
+            if lootedAny and hrp and hrp.Parent and AutoFarmEnabled and not isDepositing then
+                hrp.CFrame = getLockerCFrame()
+                task.wait(0.5)
             end
             
             if AutoSellEnabled and AutoFarmEnabled then
@@ -730,6 +1128,69 @@ task.spawn(function()
             local humanoid = char and char:FindFirstChildOfClass("Humanoid")
             if char and humanoid and humanoid.Health > 0 then
                 SellSelectedItems(false)
+            end
+        end
+    end
+end)
+
+-- [ 8. ลูปทิ้งคีย์การ์ดและยาสลบอัตโนมัติ (Global Auto-Drop Utilities Watcher) ]
+task.spawn(function()
+    while true do
+        task.wait(1.0)
+        if getgenv().TheArmory_ScriptId ~= scriptId then break end
+        
+        if AutoDropUtilities then
+            -- 1. ดรอปไอเทมประเภทคีย์การ์ด/ยาสลบใน Dungeon Inventory (ผ่านระบบจำลองกดปุ่มทิ้งของเกม)
+            pcall(function()
+                local inventoryGUI = PlayerGui:FindFirstChild("InventoryGUI")
+                local frame = inventoryGUI and inventoryGUI:FindFirstChild("Frame")
+                if frame then
+                    for _, child in ipairs(frame:GetChildren()) do
+                        if child.Name == "Prefab" then
+                            local title = child:GetAttribute("TooltipTitle") 
+                                or (child:FindFirstChild("TextLabel", true) and child:FindFirstChild("TextLabel", true).Text)
+                            if title then
+                                local nameLower = title:lower()
+                                if nameLower:find("keycard") or nameLower:find("solution") or nameLower:find("key") then
+                                    local button = child:FindFirstChild("Button") or child:FindFirstChildWhichIsA("ImageButton")
+                                    if button then
+                                        safeClick(button)
+                                        print("Dropped dungeon utility item via UI: " .. title)
+                                        task.wait(0.2)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+            
+            -- 2. ดรอปไอเทมประเภทคีย์การ์ด/ยาสลบใน Backpack / Character ของผู้เล่น
+            local backpack = LocalPlayer:FindFirstChild("Backpack")
+            local char = LocalPlayer.Character
+            
+            local function checkAndDrop(item)
+                if item:IsA("Tool") then
+                    local category = item:GetAttribute("Category")
+                    local name = item.Name:lower()
+                    if category == "Key" or category == "Solution" or name:find("keycard") or name:find("solution") then
+                        pcall(function()
+                            item.Parent = workspace
+                            print("Dropped backpack utility item: " .. item.Name)
+                        end)
+                    end
+                end
+            end
+            
+            if backpack then
+                for _, item in ipairs(backpack:GetChildren()) do
+                    checkAndDrop(item)
+                end
+            end
+            if char then
+                for _, item in ipairs(char:GetChildren()) do
+                    checkAndDrop(item)
+                end
             end
         end
     end
